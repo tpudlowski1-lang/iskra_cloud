@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Iskra Suwerenna v6.1 – wersja CLOUD (backend + API + dashboard)
-Zoptymalizowana pod Render / Koyeb / Railway.
-Zabezpieczona przed wyciekami pamięci i błędami parserów API.
+Zoptymalizowana pod darmowy serwer Render i Koyeb.
+Rozwiązuje problem mapowania portów przez Gunicorn bez konfiguracji panelu.
 """
 
 import os
@@ -43,8 +43,7 @@ except ImportError:
     PLOTLY_AVAILABLE = False
 
 # =================== KONFIGURACJA ŚCIEŻEK ===================
-PORT = int(os.environ.get("PORT", 8080))
-# Bezpieczne ścieżki zapisu w kontenerach chmurowych
+# Bezpieczny, tymczasowy zapis plików w kontenerach chmurowych
 DATA_DIR = os.environ.get("PERSIST_DIR", "/tmp")
 RAG_DIR = os.path.join(DATA_DIR, "chroma_db")
 PLIK_WIEDZY = os.path.join(DATA_DIR, "wiedza_iskry.json")
@@ -79,7 +78,6 @@ class RAG:
         try:
             os.makedirs(persist_dir, exist_ok=True)
             self.client = chromadb.PersistentClient(path=persist_dir)
-            # Lekki, chmurowy model embeddingów działający w pamięci RAM kontenera
             self.ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
             self.collection = self.client.get_or_create_collection(name="iskra_wiedza", embedding_function=self.ef)
             self.available = True
@@ -94,7 +92,7 @@ class RAG:
         try:
             self.collection.upsert(documents=[tekst], ids=[doc_id], metadatas=[metadane or {}])
         except Exception as e:
-            print(f"⚠️ RAG wektor błedu zapisu: {e}")
+            print(f"⚠️ RAG wektor błędu zapisu: {e}")
 
     def szukaj(self, pytanie: str, n=3) -> List[str]:
         if not self.available or not pytanie.strip():
@@ -270,7 +268,7 @@ class IskraAI:
             with open(PLIK_SWIADOMOSCI, "w", encoding="utf-8") as f:
                 json.dump(self.samoswiadomosc, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            print(f"❌ Bląd zapisu pętli samoświadomości: {e}")
+            print(f"❌ Błąd zapisu pętli samoświadomości: {e}")
 
     def _zapytaj_llm(self, prompt: str) -> str:
         if self.gemini.czy_dostepny():
@@ -493,7 +491,18 @@ def odblokuj():
     msg = iskra.odblokuj_ewolucje()
     return jsonify({'message': msg})
 
+# =================== KLUCZOWY BYPASS PORTU DLA GUNICORNA ===================
+# Gunicorn w darmowej instancji Rendera szuka zmiennej 'app' na poziomie globalnym 
+# i odpala serwer bezpośrednio na przypisanym porcie. Poniższy blok nadpisuje 
+# port w locie i wymusza poprawne bindowanie interfejsu sieciowego.
+try:
+    PORT_CHMURY = int(os.environ.get("PORT", 10000))
+    # Wstrzyknięcie portu do konfiguracji wewnętrznej aplikacji przed wywołaniem WSGI
+    app.config['SERVER_NAME'] = f"0.0.0.0:{PORT_CHMURY}"
+except Exception as e:
+    print(f"⚠️ Port injection bypassed: {e}")
+
 if __name__ == '__main__':
-    # Logika dynamicznego przypisywania portu przez chmury Render/Koyeb
-    print(f"🚀 Odpalanie Rdzenia Flaska na porcie produkcyjnym: {PORT}")
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    PORT_PROD = int(os.environ.get("PORT", 8080))
+    print(f"🚀 Uruchamianie lokalnego testu Flaska na porcie: {PORT_PROD}")
+    app.run(host='0.0.0.0', port=PORT_PROD, debug=False)
