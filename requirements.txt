@@ -1,5 +1,4 @@
 flask==3.0.2
-chromadb==0.4.24
 google-generativeai==0.4.1
 requests==2.31.0
 feedparser==6.0.11
@@ -7,7 +6,4 @@ beautifulsoup4==4.12.3
 plotly==5.19.0
 gunicorn==21.2.0
 numpy==1.26.4
-sentence-transformers==2.5.1
 protobuf==4.25.3
-opentelemetry-api==1.22.0
-opentelemetry-sdk==1.22.0
