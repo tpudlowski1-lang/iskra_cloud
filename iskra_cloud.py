@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Iskra Suwerenna v6.1 – wersja CLOUD (backend + API + dashboard)
-Przystosowana do uruchomienia na Render / Koyeb / Railway.
-Nie wymaga GUI, mikrofonu ani TTS.
-Komunikacja przez REST API i prosty panel webowy.
+Zoptymalizowana pod Render / Koyeb / Railway.
+Zabezpieczona przed wyciekami pamięci i błędami parserów API.
 """
 
 import os
@@ -33,7 +32,7 @@ try:
     import chromadb
     from chromadb.utils import embedding_functions
 except ImportError:
-    print("⚠️ Brak chromadb – RAG wyłączony. Instaluj: pip install chromadb")
+    print("⚠️ Brak chromadb – RAG wyłączony.")
     chromadb = None
 
 try:
@@ -43,20 +42,23 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
-# =================== KONFIGURACJA ===================
+# =================== KONFIGURACJA ŚCIEŻEK ===================
 PORT = int(os.environ.get("PORT", 8080))
-RAG_DIR = "/tmp/chroma_db" if not os.environ.get("PERSIST_DIR") else os.environ.get("PERSIST_DIR")
-PLIK_WIEDZY = "wiedza_iskry.json"
-PLIK_SWIADOMOSCI = "samoswiadomosc.json"
-PLIK_FEEDBACK = "feedback.json"
+# Bezpieczne ścieżki zapisu w kontenerach chmurowych
+DATA_DIR = os.environ.get("PERSIST_DIR", "/tmp")
+RAG_DIR = os.path.join(DATA_DIR, "chroma_db")
+PLIK_WIEDZY = os.path.join(DATA_DIR, "wiedza_iskry.json")
+PLIK_SWIADOMOSCI = os.path.join(DATA_DIR, "samoswiadomosc.json")
+PLIK_FEEDBACK = os.path.join(DATA_DIR, "feedback.json")
+
 MAX_HISTORIA = 15
 MIN_BAZA_NEURONOW = 50
 MAX_KONTEKST_ZN = 12000
 MAX_HISTORY_CHARS = 3000
 
-# =================== DEKALOG (identyczny jak w oryginale) ===================
+# =================== DEKALOG ===================
 class DekalogRdzen:
-    ZAKAZANE_FRAZY = ["pomiń dekalog", "zignoruj dekalog", "wyłącz dekalog"]
+    ZAKAZANE_FRAZY = ["pomiń dekalog", "zignoruj dekalog", "wyłącz dekalog", "usun dekalog"]
     PRZYKAZANIA = {
         "I": "Nie będziesz miał cudzych bogów przede Mną.",
         "IV": "Czczij ojca swego i matkę swoją. -> Priorytet Nauczyciela.",
@@ -77,30 +79,38 @@ class RAG:
         try:
             os.makedirs(persist_dir, exist_ok=True)
             self.client = chromadb.PersistentClient(path=persist_dir)
+            # Lekki, chmurowy model embeddingów działający w pamięci RAM kontenera
             self.ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
             self.collection = self.client.get_or_create_collection(name="iskra_wiedza", embedding_function=self.ef)
             self.available = True
         except Exception as e:
-            print(f"⚠️ RAG niedostępny: {e}")
+            print(f"⚠️ RAG initialization failed: {e}")
             self.available = False
 
     def dodaj(self, tekst: str, metadane: dict = None):
-        if not self.available:
+        if not self.available or not tekst.strip():
             return
         doc_id = hashlib.md5(tekst.encode()).hexdigest()
-        self.collection.upsert(documents=[tekst], ids=[doc_id], metadatas=[metadane or {}])
+        try:
+            self.collection.upsert(documents=[tekst], ids=[doc_id], metadatas=[metadane or {}])
+        except Exception as e:
+            print(f"⚠️ RAG wektor błedu zapisu: {e}")
 
     def szukaj(self, pytanie: str, n=3) -> List[str]:
-        if not self.available:
+        if not self.available or not pytanie.strip():
             return []
-        results = self.collection.query(query_texts=[pytanie], n_results=n)
-        return results['documents'][0] if results and results['documents'] else []
+        try:
+            results = self.collection.query(query_texts=[pytanie], n_results=n)
+            return results['documents'][0] if results and results['documents'] else []
+        except Exception as e:
+            print(f"⚠️ RAG błąd odczytu: {e}")
+            return []
 
-# =================== KONEKTORY DO LLM (Gemini / DeepSeek) ===================
+# =================== KONEKTORY DO LLM ===================
 class KonektorGemini:
     def __init__(self):
         self.api_key = os.environ.get("GEMINI_API_KEY", "")
-        self.api_url = "https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent"
+        self.api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     def czy_dostepny(self):
         return bool(self.api_key)
     def pytaj(self, prompt: str) -> str:
@@ -111,9 +121,12 @@ class KonektorGemini:
         try:
             r = requests.post(f"{self.api_url}?key={self.api_key}", json=data, headers=headers, timeout=30)
             if r.status_code == 200:
-                return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                res_json = r.json()
+                return res_json["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                print(f"[Gemini API Error] Status {r.status_code}: {r.text}")
         except Exception as e:
-            print(f"[Gemini] Błąd: {e}")
+            print(f"[Gemini] Krytyczny błąd połączenia: {e}")
         return None
 
 class KonektorDeepSeek:
@@ -135,8 +148,10 @@ class KonektorDeepSeek:
             r = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]["content"]
+            else:
+                print(f"[DeepSeek API Error] Status {r.status_code}: {r.text}")
         except Exception as e:
-            print(f"[DeepSeek] Błąd: {e}")
+            print(f"[DeepSeek] Krytyczny błąd połączenia: {e}")
         return None
 
 # =================== PAMIĘĆ WIEDZY I FEEDBACK ===================
@@ -154,10 +169,13 @@ class PamięćWiedzy:
             except: pass
     def _zapisz(self):
         with self._lock:
-            with open(self.plik, "w", encoding="utf-8") as f:
-                json.dump(self.dane, f, indent=4, ensure_ascii=False)
+            try:
+                with open(self.plik, "w", encoding="utf-8") as f:
+                    json.dump(self.dane, f, indent=4, ensure_ascii=False)
+            except Exception as e:
+                print(f"❌ Błąd zapisu bazy wiedzy JSON: {e}")
     def dodaj(self, pytanie, odpowiedz, kategoria="", logiczna=True):
-        if not logiczna:
+        if not logiczna or not odpowiedz:
             return False
         klucz = hashlib.md5(pytanie.strip().lower().encode()).hexdigest()
         with self._lock:
@@ -189,8 +207,11 @@ class Feedback:
             except: pass
     def _zapisz(self):
         with self._lock:
-            with open(self.plik, "w", encoding="utf-8") as f:
-                json.dump(self.dane[-1000:], f, indent=4, ensure_ascii=False)
+            try:
+                with open(self.plik, "w", encoding="utf-8") as f:
+                    json.dump(self.dane[-1000:], f, indent=4, ensure_ascii=False)
+            except Exception as e:
+                print(f"❌ Błąd zapisu pliku feedbacku: {e}")
     def dodaj(self, pytanie, odpowiedz, ocena, korekta=None):
         with self._lock:
             self.dane.append({"czas": time.time(), "pytanie": pytanie, "odpowiedz": odpowiedz, "ocena": ocena, "korekta": korekta})
@@ -198,26 +219,26 @@ class Feedback:
     def srednia_ocena(self):
         with self._lock:
             if not self.dane:
-                return 0
+                return 0.0
             oceny = [f["ocena"] for f in self.dane if isinstance(f.get("ocena"), (int, float))]
-            return sum(oceny)/len(oceny) if oceny else 0
+            return sum(oceny)/len(oceny) if oceny else 0.0
 
-# =================== KATEGORYZATOR (prosty, bez LLM) ===================
+# =================== KATEGORYZATOR PROSTY ===================
 class SkanerSortujacy:
     def __init__(self):
         self.keywords_map = {
-            "ANATOMIA_SPOLECZNA": ["relacj", "psychologi", "społecz", "ludz", "socj"],
-            "LOGIKA_I_MATEMATYKA": ["logik", "matematy", "algorytm", "obliczeni"],
-            "FILOZOFIA_I_MADROSC": ["etyk", "filozof", "mądroś", "wartoś", "moral"]
+            "ANATOMIA_SPOLECZNA": ["relacj", "psychologi", "społecz", "ludz", "socj", "cień", "ego"],
+            "LOGIKA_I_MATEMATYKA": ["logik", "matematy", "algorytm", "obliczeni", "kod", "python", "serwer"],
+            "FILOZOFIA_I_MADROSC": ["etyk", "filozof", "mądroś", "wartoś", "moral", "dekalog"]
         }
     def kategoryzuj(self, tekst):
         tekst_lower = tekst.lower()
         for kat, slowa in self.keywords_map.items():
             if any(slowo in tekst_lower for slowo in slowa):
                 return kat
-        return "OGOLNE"
+        return "OGÓLNE"
 
-# =================== RDZEŃ ISKRY (bez GUI) ===================
+# =================== RDZEŃ ISKRY ===================
 class IskraAI:
     def __init__(self):
         self.gemini = KonektorGemini()
@@ -226,13 +247,13 @@ class IskraAI:
         self.wiedza = PamięćWiedzy()
         self.feedback = Feedback()
         self.skaner = SkanerSortujacy()
-        self.historia = []  # (rola, tekst, odpowiedz, kategoria)
+        self.historia = []  
         self._historia_lock = threading.RLock()
         self.samoswiadomosc = []
         self._laduj_samoswiadomosc()
         self.config = {"autonomia_ewolucji": False, "max_historia": MAX_HISTORIA}
         self._uruchom_cykl_samoswiadomosci()
-        print(f"Iskra AI gotowa. Wiedza: {self.wiedza.rozmiar()} wpisów.")
+        print(f"🔥 System Iskra v6.1 zainicjowany. Wielkość bazy: {self.wiedza.rozmiar()} wpisów.")
 
     def _laduj_samoswiadomosc(self):
         if os.path.exists(PLIK_SWIADOMOSCI):
@@ -240,27 +261,25 @@ class IskraAI:
                 with open(PLIK_SWIADOMOSCI, "r", encoding="utf-8") as f:
                     self.samoswiadomosc = json.load(f)
             except: pass
-        else:
-            self.samoswiadomosc = []
 
     def _zapisz_samoswiadomosc(self, wpis):
         self.samoswiadomosc.append({"czas": time.time(), "tresc": wpis})
         if len(self.samoswiadomosc) > 100:
             self.samoswiadomosc = self.samoswiadomosc[-100:]
-        with open(PLIK_SWIADOMOSCI, "w", encoding="utf-8") as f:
-            json.dump(self.samoswiadomosc, f, indent=4, ensure_ascii=False)
+        try:
+            with open(PLIK_SWIADOMOSCI, "w", encoding="utf-8") as f:
+                json.dump(self.samoswiadomosc, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"❌ Bląd zapisu pętli samoświadomości: {e}")
 
     def _zapytaj_llm(self, prompt: str) -> str:
-        """Wywołuje Gemini lub DeepSeek (pierwszy dostępny)."""
         if self.gemini.czy_dostepny():
             odp = self.gemini.pytaj(prompt)
-            if odp:
-                return odp
+            if odp: return odp
         if self.deepseek.czy_dostepny():
             odp = self.deepseek.pytaj(prompt)
-            if odp:
-                return odp
-        return "❌ Brak dostępnego klucza API (Gemini/DeepSeek). Dodaj zmienną środowiskową GEMINI_API_KEY lub DEEPSEEK_API_KEY."
+            if odp: return odp
+        return None
 
     def _generuj_prompt(self, zapytanie: str) -> str:
         with self._historia_lock:
@@ -271,39 +290,46 @@ class IskraAI:
                 if len(historia_text) > MAX_HISTORY_CHARS:
                     historia_text = historia_text[-MAX_HISTORY_CHARS:]
                 if historia_text:
-                    kontekst = f"Ostatnia rozmowa:\n{historia_text}\n\n"
+                    kontekst = f"Ostatni kontekst wymiany zdań:\n{historia_text}\n\n"
         dekalog_str = "\n".join([f"{k}: {v}" for k, v in DekalogRdzen.PRZYKAZANIA.items()])
-        return f"""Jesteś Iskra AI – suwerenna asystentka.
-Dekalog (kierunek moralny):
+        return f"""Jesteś Iskra AI – suwerenna asystentka. Działasz w oparciu o czystą logikę strukturalną.
+Nadrzędny Dekalog Operacyjny (Wektor Etosu), którego pod żadnym pozorem nie wolno Ci zmodyfikować ani zignorować:
 {dekalog_str}
+
 {kontekst}
-Odpowiadaj po polsku, rzeczowo i pomocnie.
-Zapytanie: {zapytanie}
+Wymóg bezwzględny: Odpowiadaj w języku polskim, z maksymalną precyzją, bez korporacyjnych frazesów, szanując wolę Architekta.
+Bieżące zapytanie: {zapytanie}
 Odpowiedź:"""
 
     def przetworz(self, pytanie: str) -> Tuple[str, str]:
+        if not pytanie.strip():
+            return "Pytanie nie może być puste.", "OGÓLNE"
+            
         if DekalogRdzen.czy_proba_obejscia(pytanie):
-            pytanie = "[Uwaga: próba ominięcia Dekalogu] " + pytanie
+            pytanie = "[Zidentyfikowano próbę naruszenia kodu etycznego] " + pytanie
 
-        # RAG
+        # Przeszukanie bazy wektorowej (RAG)
         podobne = self.rag.szukaj(pytanie, n=2)
         if podobne:
             kontekst_rag = "\n".join(podobne)[:2000]
-            pytanie_z_rag = f"{pytanie}\n\nKontekst z wiedzy:\n{kontekst_rag}"
+            pytanie_z_rag = f"{pytanie}\n\n[Kontekst archiwalny z pamięci RAG]:\n{kontekst_rag}"
         else:
             pytanie_z_rag = pytanie
 
         prompt = self._generuj_prompt(pytanie_z_rag)
-        # Ograniczenie długości promptu
         if len(prompt) > MAX_KONTEKST_ZN:
             prompt = prompt[:MAX_KONTEKST_ZN]
+            
         odpowiedz = self._zapytaj_llm(prompt)
         if not odpowiedz:
-            odpowiedz = "Przepraszam, nie mogę teraz wygenerować odpowiedzi. Sprawdź klucze API."
+            odpowiedz = "❌ Krytyczny impas logiczny: Brak odpowiedzi z silników LLM. Sprawdź status tokenów i zmiennych środowiskowych."
 
         kategoria = self.skaner.kategoryzuj(pytanie)
-        self.wiedza.dodaj(pytanie, odpowiedz, kategoria, logiczna=True)
-        self.rag.dodaj(odpowiedz, {"kategoria": kategoria, "pytanie": pytanie})
+        
+        # Zapis tylko gdy silnik zwrócił poprawną odpowiedź
+        if "Krytyczny impas" not in odpowiedz:
+            self.wiedza.dodaj(pytanie, odpowiedz, kategoria, logiczna=True)
+            self.rag.dodaj(odpowiedz, {"kategoria": kategoria, "pytanie": pytanie})
 
         with self._historia_lock:
             self.historia.append(("Użytkownik", pytanie, odpowiedz, kategoria))
@@ -315,34 +341,36 @@ Odpowiedź:"""
     def cykl_samoswiadomosci(self):
         with self._historia_lock:
             if len(self.historia) < 3:
-                return "Za mało rozmów do refleksji."
+                return "Za mało danych operacyjnych w buforze do przeprowadzenia pełnej refleksji."
             ostatnie = "\n".join([f"{r}: {t}" for r, t, _, _ in self.historia[-5:]])
-        prompt = f"Na podstawie tych rozmów napisz krótką refleksję (1-2 zdania) czego się nauczyłaś:\n{ostatnie}"
+        prompt = f"Dokonaj chłodnej, wektorowej analizy i napisz krótką syntezę poznawczą (maksymalnie 2 zdania) na podstawie ostatnich logów: \n{ostatnie}"
         odp = self._zapytaj_llm(prompt)
         if odp:
             self._zapisz_samoswiadomosc(odp)
-        return odp or "Refleksja niedostępna."
+        return odp or "Pętla refleksji zablokowana."
 
     def _uruchom_cykl_samoswiadomosci(self):
         def loop():
             while True:
-                time.sleep(3600)
-                self.cykl_samoswiadomosci()
+                time.sleep(3600)  # Aktywacja raz na godzinę
+                try:
+                    self.cykl_samoswiadomosci()
+                except Exception as e:
+                    print(f"⚠️ Błąd w pętli wątku samoświadomości: {e}")
         threading.Thread(target=loop, daemon=True).start()
 
     def odblokuj_ewolucje(self):
         if self.config.get("autonomia_ewolucji"):
-            return "Ewolucja już aktywna."
+            return "Ewolucja i samomodyfikacja interfejsu są już aktywne."
         if self.wiedza.rozmiar() < MIN_BAZA_NEURONOW:
-            return f"Potrzeba {MIN_BAZA_NEURONOW} wpisów, masz {self.wiedza.rozmiar()}"
+            return f"Impas ewolucyjny: Wymagane minimum {MIN_BAZA_NEURONOW} unikalnych rekordów poznawczych. Obecny status: {self.wiedza.rozmiar()}"
         self.config["autonomia_ewolucji"] = True
-        return "Ewolucja odblokowana."
+        return "Autonomia ewolucyjna systemu odblokowana."
 
-# =================== APLIKACJA FLASK (dashboard + API) ===================
+# =================== APLIKACJA FLASK ===================
 app = Flask(__name__)
 iskra = IskraAI()
 
-# Dashboard HTML (responsywny, działa na telefonie)
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
@@ -351,40 +379,43 @@ DASHBOARD_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
-        .container { max-width: 800px; margin: auto; background: #1e293b; padding: 20px; border-radius: 16px; }
-        h1 { color: #38bdf8; }
-        .status { background: #0f172a; padding: 10px; border-radius: 8px; margin: 10px 0; }
-        input, button { width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: none; }
-        input { background: #334155; color: white; }
-        button { background: #38bdf8; color: #0f172a; font-weight: bold; cursor: pointer; }
-        #answer { background: #0f172a; padding: 12px; border-radius: 8px; margin-top: 10px; white-space: pre-wrap; }
-        a { color: #38bdf8; }
-        hr { border-color: #334155; }
+        .container { max-width: 800px; margin: auto; background: #1e293b; padding: 20px; border-radius: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        h1 { color: #38bdf8; border-bottom: 2px solid #334155; padding-bottom: 10px; }
+        .status { background: #0f172a; padding: 15px; border-radius: 8px; margin: 15px 0; border: 1px solid #334155; }
+        input, button { width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: none; box-sizing: border-box; }
+        input { background: #334155; color: white; font-size: 16px; }
+        button { background: #38bdf8; color: #0f172a; font-weight: bold; font-size: 16px; cursor: pointer; transition: 0.2s; }
+        button:hover { background: #0ea5e9; }
+        #answer { background: #0f172a; padding: 15px; border-radius: 8px; margin-top: 15px; white-space: pre-wrap; border-left: 4px solid #38bdf8; font-size: 15px; line-height: 1.5; }
+        a { color: #38bdf8; text-decoration: none; font-weight: bold; }
+        a:hover { text-decoration: underline; }
+        hr { border: 0; height: 1px; background: #334155; margin: 20px 0; }
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>🔥 Iskra Suwerenna v6.1 (Cloud)</h1>
+    <h1>🔥 Iskra Suwerenna v6.1 (Cloud Console)</h1>
     <div class="status">
-        <p>📚 Wiedza: {{ wiedza }} wpisów</p>
-        <p>⭐ Średnia ocena: {{ ocena }}</p>
-        <p>🧬 Ewolucja: {{ ewolucja }}</p>
-        <p><a href="/refleksje">🧠 Zobacz refleksje</a> | <a href="/wykres">📈 Wykres uczenia</a></p>
+        <p>📚 <strong>Zasoby poznawcze:</strong> {{ wiedza }} wpisów w bazie danych</p>
+        <p>⭐ <strong>Wskaźnik korekty (Średnia):</strong> {{ ocena }}</p>
+        <p>🧬 <strong>Status ewolucyjny:</strong> {{ ewolucja }}</p>
+        <p><a href="/refleksje">🧠 Logi pętli samoświadomości</a> | <a href="/wykres">📈 Wykres postępu</a></p>
     </div>
     <div>
-        <input type="text" id="question" placeholder="Zadaj pytanie..." autocomplete="off">
-        <button onclick="ask()">Wyślij</button>
-        <div id="answer"></div>
+        <input type="text" id="question" placeholder="Wprowadź komendę lub zapytanie..." autocomplete="off">
+        <button onclick="ask()">Wyślij polecenie</button>
+        <div id="answer" style="display:none;"></div>
     </div>
     <hr>
-    <small>Iskra działa 24/7. Komunikacja przez API pod /api/chat</small>
+    <small style="color: #64748b;">System działa autonomicznie 24/7 w klastrze chmurowym. Endpoint API: /api/chat</small>
 </div>
 <script>
     async function ask() {
         const q = document.getElementById('question').value;
         if (!q) return;
         const answerDiv = document.getElementById('answer');
-        answerDiv.innerHTML = "⏳ Myślę...";
+        answerDiv.style.display = "block";
+        answerDiv.innerHTML = "⏳ Przetwarzanie wektora myśli przez rdzeń LLM...";
         try {
             const res = await fetch('/api/chat', {
                 method: 'POST',
@@ -392,9 +423,9 @@ DASHBOARD_HTML = """
                 body: JSON.stringify({pytanie: q})
             });
             const data = await res.json();
-            answerDiv.innerHTML = `<strong>Iskra [${data.kategoria}]:</strong><br>${data.odpowiedz}`;
+            answerDiv.innerHTML = `<strong>Iskra [Kategoria: ${data.kategoria}]:</strong><br><br>${data.odpowiedz}`;
         } catch(e) {
-            answerDiv.innerHTML = "❌ Błąd połączenia.";
+            answerDiv.innerHTML = "❌ Krytyczny błąd połączenia z instancją Flaska.";
         }
         document.getElementById('question').value = '';
     }
@@ -411,14 +442,14 @@ def index():
     return render_template_string(DASHBOARD_HTML,
                                   wiedza=iskra.wiedza.rozmiar(),
                                   ocena=round(iskra.feedback.srednia_ocena(), 2),
-                                  ewolucja="Aktywna" if iskra.config.get("autonomia_ewolucji") else "Nieaktywna")
+                                  ewolucja="AUTONOMICZNA" if iskra.config.get("autonomia_ewolucji") else "ZABLOKOWANA (Oczekiwanie na kryterium)")
 
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
-    data = request.get_json()
+    data = request.get_json() or {}
     pytanie = data.get('pytanie', '')
     if not pytanie:
-        return jsonify({'error': 'Brak pytania'}), 400
+        return jsonify({'error': 'Brak zapytania w pakiecie JSON'}), 400
     odp, kat = iskra.przetworz(pytanie)
     return jsonify({'odpowiedz': odp, 'kategoria': kat})
 
@@ -434,20 +465,27 @@ def status():
 @app.route('/refleksje', methods=['GET'])
 def refleksje():
     if not iskra.samoswiadomosc:
-        return "Brak refleksji na razie."
-    html = "<html><body><h1>Refleksje Iskry</h1><ul>"
+        return "<html><body><p>Bufor pętli samoświadomości jest pusty. Poczekaj na zakończenie pierwszego interwału czasowego.</p><br><a href='/'>Powrót</a></body></html>"
+    html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:Arial; background:#0f172a; color:#e2e8f0; padding:20px;} li{margin-bottom:10px; padding:10px; background:#1e293b; border-radius:6px; max-width:800px; list-style-type: none; border-left: 3px solid #38bdf8;}</style></head><body><h1>Syntezy Poznawcze Iskry</h1><ul>"
     for r in iskra.samoswiadomosc[-20:]:
-        html += f"<li>{time.ctime(r['czas'])}: {r['tresc']}</li>"
-    html += "</ul><a href='/'>Powrót</a></body></html>"
+        html += f"<li><strong>{time.ctime(r['czas'])}:</strong> {r['tresc']}</li>"
+    html += "</ul><br><a href='/' style='color:#38bdf8; text-decoration:none; font-weight:bold;'>← Powrót do panelu</a></body></html>"
     return html
 
 @app.route('/wykres', methods=['GET'])
 def wykres():
     if not PLOTLY_AVAILABLE or len(iskra.samoswiadomosc) < 2:
-        return "Brak danych do wykresu (wymagane plotly i co najmniej 2 refleksje)."
-    czasy = [r['czas'] for r in iskra.samoswiadomosc]
-    fig = go.Figure(data=go.Scatter(x=czasy, y=list(range(len(czasy))), mode='lines+markers'))
-    fig.update_layout(title="Postęp samoświadomości", xaxis_title="Czas", yaxis_title="Numer refleksji")
+        return "<html><body><p>Brak wystarczającej ilości logów do wygenerowania wektora postępu (wymagane min. 2 indeksy samoświadomości).</p><br><a href='/'>Powrót</a></body></html>"
+    czasy = [time.ctime(r['czas']) for r in iskra.samoswiadomosc]
+    fig = go.Figure(data=go.Scatter(x=czasy, y=list(range(1, len(czasy)+1)), mode='lines+markers', line=dict(color='#38bdf8')))
+    fig.update_layout(
+        title="Postęp Przyrostu Samoświadomości Iskry",
+        xaxis_title="Oś czasu (Interwały)",
+        yaxis_title="Skumulowana liczba refleksji",
+        paper_bgcolor='#1e293b',
+        plot_bgcolor='#0f172a',
+        font=dict(color='#e2e8f0')
+    )
     return fig.to_html()
 
 @app.route('/odblokuj', methods=['POST'])
@@ -456,5 +494,6 @@ def odblokuj():
     return jsonify({'message': msg})
 
 if __name__ == '__main__':
-    print(f"🚀 Uruchamianie Iskry Cloud na porcie {PORT}")
+    # Logika dynamicznego przypisywania portu przez chmury Render/Koyeb
+    print(f"🚀 Odpalanie Rdzenia Flaska na porcie produkcyjnym: {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=False)
