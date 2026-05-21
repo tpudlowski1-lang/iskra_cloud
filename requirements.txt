@@ -1,6 +1,6 @@
-flask
-requests
-chromadb
-plotly
-sentence-transformers
-gunicorn
+flask>=2.3,<3
+requests>=2.31
+chromadb>=0.4
+plotly>=5.15
+sentence-transformers>=2.2
+gunicorn>=21.2
